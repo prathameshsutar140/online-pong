@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Single-file Pong — Local & Online</title>
+<style>
+  :root{--bg:#0b1220;--fg:#e6eef8;--accent:#5ad;}
+  html,body{height:100%;margin:0;font-family:Inter,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg);}
+  .wrap{max-width:980px;margin:18px auto;padding:18px;}
+  h1{margin:0 0 8px;font-size:20px}
+  #ui{display:flex;gap:12px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+  select,button,textarea{font-size:14px}
+  canvas{background:#02102a;border:2px solid #123;display:block;margin:12px 0;border-radius:6px}
+  .info{font-size:13px;opacity:.9}
+  #netBoxes{display:flex;gap:8px;flex-wrap:wrap}
+  textarea{width:420px;height:120px;background:#021;color:var(--fg);border:1px solid #234;padding:8px;resize:vertical}
+  .controls{display:flex;gap:8px;align-items:center}
+  .score{font-size:18px;margin-left:auto}
+  footer{margin-top:12px;font-size:12px;color:#9fb}
+  .modeHint{font-size:13px;color:#9fb;margin-top:6px}
+  @media(max-width:760px){textarea{width:100%}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Single-file Pong — Local & Online</h1>
+  <div id="ui">
+    <label>Mode:
+      <select id="mode">
+        <option value="single">Single Player (vs Computer)</option>
+        <option value="local">Local 2 Players (same device)</option>
+        <option value="host">Online — Host (create offer)</option>
+        <option value="client">Online — Join (paste offer)</option>
+      </select>
+    </label>
+    <div class="controls">
+      <button id="startBtn">Start</button>
+      <button id="pauseBtn">Pause</button>
+      <button id="resetBtn">Reset Scores</button>
+    </div>
+    <div class="score" id="scoreBoard">0 : 0</div>
+  </div>
+
+  <canvas id="screen" width="900" height="500"></canvas>
+
+  <div class="modeHint" id="modeHint">
+    Left paddle (Player 1) controlled by mouse. In Single-player, arrow keys also move left paddle. Local 2-player uses W/S for left and Up/Down for right.
+  </div>
+
+  <div id="netBoxes" style="margin-top:10px">
+    <div>
+      <div style="font-weight:600">Host: create an offer and share it with friend</div>
+      <button id="createOffer">Host Online (Create Offer)</button>
+      <div style="font-size:13px;color:#9fb">After clicking, wait a moment for ICE gathering then copy the Offer text and send to your friend.</div>
+      <textarea id="offerBox" placeholder="Offer will appear here (copy & send)"></textarea>
+      <div style="font-size:13px;color:#9fb">Paste Answer back here (from your friend) then click Apply Answer</div>
+      <textarea id="answerForHost" placeholder="Paste Answer from friend here"></textarea>
+      <button id="applyAnswer">Apply Answer</button>
+    </div>
+    <div>
+      <div style="font-weight:600">Join: paste Host's offer, create answer and send it back</div>
+      <div style="font-size:13px;color:#9fb">Paste the Offer you received and click Create Answer. Copy the Answer text and send back to the Host.</div>
+      <textarea id="offerForClient" placeholder="Paste Offer from Host here"></textarea>
+      <button id="createAnswer">Join Online (Create Answer)</button>
+      <textarea id="answerBox" placeholder="Answer will appear here to copy & send"></textarea>
+    </div>
+  </div>
+
+  <footer>
+    Controls summary: Single: left paddle = mouse (or ArrowUp/ArrowDown). Local 2-player: left = W/S or mouse, right = ArrowUp/ArrowDown. Online: Host is left; Guest is right and uses Up/Down arrows (or mouse on host). Use the Signaling boxes to exchange Offer/Answer manually (copy-paste).
+  </footer>
+</div>
+
+<script>
+/*
+  Single-file Pong with:
+   - Single-player vs AI
+   - Local 2-player
+   - Online host/join via manual WebRTC signaling (datachannel)
+  Host is authoritative for the game state (ball physics).
+  Client sends paddle Y; host simulates and sends full state to client.
+*/
+
+// ---- Canvas and drawing ----
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// UI elements
+const modeSelect = document.getElementById('mode');
+const startBtn = document.getElementById('startBtn');
+const pauseBtn = document.getElementById('pauseBtn');
+const resetBtn = document.getElementById('resetBtn');
+const scoreBoard = document.getElementById('scoreBoard');
+const modeHint = document.getElementById('modeHint');
+
+const offerBox = document.getElementById('offerBox');
+const answerForHost = document.getElementById('answerForHost');
+const createOfferBtn = document.getElementById('createOffer');
+const applyAnswerBtn = document.getElementById('applyAnswer');
+
+const offerForClient = document.getElementById('offerForClient');
+const createAnswerBtn = document.getElementById('createAnswer');
+const answerBox = document.getElementById('answerBox');
+
+let running = false;
+let paused = false;
+
+// ---- Game objects ----
+const paddle = {w:12, h:90, speed:6};
+const ballRadius = 8;
+
+let leftY = (H - paddle.h)/2;
+let rightY = (H - paddle.h)/2;
+let ball = {x:W/2, y:H/2, vx:5, vy:3};
+let scores = {left:0, right:0};
+
+function resetBall(toLeft = true) {
+  ball.x = W/2; ball.y = H/2;
+  // randomize angle
+  const ang = (Math.random()*Math.PI/3 - Math.PI/6); // -30°..30°
+  const speed = 5 + Math.random()*1.5;
+  ball.vx = (toLeft ? -1 : 1) * speed * Math.cos(ang);
+  ball.vy = speed * Math.sin(ang);
+}
+
+// ---- Input handling ----
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+});
+window.addEventListener('keyup', e => {
+  keys[e.key.toLowerCase()] = false;
+});
+
+canvas.addEventListener('mousemove', e => {
+  // map mouse to left paddle
+  const rect = canvas.getBoundingClientRect();
+  const y = e.clientY - rect.top;
+  if (currentMode === 'single' || currentMode === 'host' || currentMode === 'local') {
+    leftY = Math.max(0, Math.min(H - paddle.h, y - paddle.h/2));
+    // send input to remote if online host? host is authoritative so remote doesn't need left input
+  } else if (currentMode === 'client') {
+    // client controls right paddle -> send to host via data channel (if connected)
+    rightY = Math.max(0, Math.min(H - paddle.h, y - paddle.h/2));
+    sendClientInput();
+  }
+});
+
+// ---- Modes ----
+let currentMode = modeSelect.value;
+modeSelect.addEventListener('change', () => {
+  currentMode = modeSelect.value;
+  updateModeHint();
+  // reset networking textfields when switching
+  if (currentMode!=='host') offerBox.value = '';
+  if (currentMode!=='client') answerBox.value = '';
+});
+function updateModeHint(){
+  if (currentMode === 'single') {
+    modeHint.textContent = 'Single-player: left paddle controlled by mouse and ArrowUp/ArrowDown. Right paddle is AI.';
+  } else if (currentMode === 'local') {
+    modeHint.textContent = 'Local 2-player: left paddle = W/S or mouse, right paddle = ArrowUp/ArrowDown.';
+  } else if (currentMode === 'host') {
+    modeHint.textContent = 'Host online: you are left player (authoritative). Create an Offer and send to friend. After they reply with Answer, paste it and Apply Answer.';
+  } else {
+    modeHint.textContent = 'Join online: paste the Offer you received and click Create Answer. Send the Answer back to the Host.';
+  }
+}
+updateModeHint();
+
+// ---- AI for right paddle (single-player) ----
+function aiMove() {
+  // basic tracking with max speed and some deadzone
+  const center = rightY + paddle.h/2;
+  const dy = ball.y - center;
+  const maxSpeed = 4.5;
+  rightY += Math.max(-maxSpeed, Math.min(maxSpeed, dy * 0.12));
+  // clamp
+  rightY = Math.max(0, Math.min(H - paddle.h, rightY));
+}
+
+// ---- Physics / collision ----
+function stepPhysics(dt, hostIsAuthoritative=true) {
+  // dt unused for now (frame-based)
+  // Move ball if host
+  ball.x += ball.vx;
+  ball.y += ball.vy;
+
+  // Top/bottom walls
+  if (ball.y - ballRadius < 0) {
+    ball.y = ballRadius; ball.vy = -ball.vy;
+  } else if (ball.y + ballRadius > H) {
+    ball.y = H - ballRadius; ball.vy = -ball.vy;
+  }
+
+  // Left paddle collision
+  if (ball.x - ballRadius <= paddle.w) {
+    if (ball.y >= leftY && ball.y <= leftY + paddle.h) {
+      ball.x = paddle.w + ballRadius;
+      // reflect and add spin based on hit position
+      const rel = (ball.y - (leftY + paddle.h/2)) / (paddle.h/2); // -1..1
+      const speed = Math.hypot(ball.vx, ball.vy);
+      const newSpeed = Math.min(12, speed * 1.03 + 0.2);
+      const angle = rel * (Math.PI/3); // up to 60°
+      ball.vx = Math.abs(newSpeed * Math.cos(angle));
+      ball.vy = newSpeed * Math.sin(angle);
+    } else if (ball.x < 0) {
+      // Score for right
+      scores.right++;
+      resetBall(false);
+      sendStateIfHost();
+    }
+  }
+
+  // Right paddle collision
+  if (ball.x + ballRadius >= W - paddle.w) {
+    if (ball.y >= rightY && ball.y <= rightY + paddle.h) {
+      ball.x = W - paddle.w - ballRadius;
+      const rel = (ball.y - (rightY + paddle.h/2)) / (paddle.h/2);
+      const speed = Math.hypot(ball.vx, ball.vy);
+      const newSpeed = Math.min(12, speed * 1.03 + 0.2);
+      const angle = rel * (Math.PI/3);
+      ball.vx = -Math.abs(newSpeed * Math.cos(angle));
+      ball.vy = newSpeed * Math.sin(angle);
+    } else if (ball.x > W) {
+      // Score for left
+      scores.left++;
+      resetBall(true);
+      sendStateIfHost();
+    }
+  }
+}
+
+// ---- Draw ----
+function draw() {
+  ctx.clearRect(0,0,W,H);
+
+  // middle dashed line
+  ctx.strokeStyle = '#113';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([10,10]);
+  ctx.beginPath();
+  ctx.moveTo(W/2,0);
+  ctx.lineTo(W/2,H);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // paddles
+  ctx.fillStyle = '#7fd';
+  ctx.fillRect(0, leftY, paddle.w, paddle.h);
+  ctx.fillRect(W - paddle.w, rightY, paddle.w, paddle.h);
+
+  // ball
+  ctx.beginPath();
+  ctx.fillStyle = '#ffd';
+  ctx.arc(ball.x, ball.y, ballRadius, 0, Math.PI*2);
+  ctx.fill();
+
+  // scores
+  scoreBoard.textContent = scores.left + ' : ' + scores.right;
+}
+
+// ---- Game loop ----
+let lastTime = 0;
+function frame(t) {
+  if (!running) return;
+  if (paused) { requestAnimationFrame(frame); return; }
+  const dt = (t - lastTime) || 16;
+  lastTime = t;
+
+  // Input depending on mode
+  if (currentMode === 'single') {
+    // allow arrow keys for left movement and mouse is also active
+    if (keys['arrowup']) leftY = Math.max(0, leftY - 6);
+    if (keys['arrowdown']) leftY = Math.min(H - paddle.h, leftY + 6);
+    aiMove();
+    stepPhysics(dt, true);
+  } else if (currentMode === 'local') {
+    // left uses w/s or mouse; right uses arrows
+    if (keys['w']) leftY = Math.max(0, leftY - 6);
+    if (keys['s']) leftY = Math.min(H - paddle.h, leftY + 6);
+    if (keys['arrowup']) rightY = Math.max(0, rightY - 6);
+    if (keys['arrowdown']) rightY = Math.min(H - paddle.h, rightY + 6);
+    stepPhysics(dt, true);
+  } else if (currentMode === 'host') {
+    // host is authoritative left. If client connected, rightY will be updated by incoming messages.
+    if (keys['arrowup']) leftY = Math.max(0, leftY - 6);
+    if (keys['arrowdown']) leftY = Math.min(H - paddle.h, leftY + 6);
+    stepPhysics(dt, true);
+    // send frequent state updates
+    if (t % 2 < 1) sendStateIfHost();
+  } else if (currentMode === 'client') {
+    // client only sends inputs; receives authoritative state from host and interpolates
+    if (keys['arrowup']) rightY = Math.max(0, rightY - 6);
+    if (keys['arrowdown']) rightY = Math.min(H - paddle.h, rightY + 6);
+    // client-side smoothing shown by drawing remote state updated when host sends it.
+    sendClientInput(); // send current paddle pos frequently
+    // Do NOT run physics here (host does)
+  }
+
+  draw();
+  requestAnimationFrame(frame);
+}
+
+// ---- Start / Pause / Reset ----
+startBtn.addEventListener('click', () => {
+  if (!running) {
+    running = true;
+    lastTime = performance.now();
+    requestAnimationFrame(frame);
+  }
+  paused = false;
+});
+pauseBtn.addEventListener('click', () => { paused = !paused; pauseBtn.textContent = paused ? 'Resume' : 'Pause'; });
+resetBtn.addEventListener('click', () => { scores.left = scores.right = 0; updateScoreBoard(); });
+
+// ---- Scoreboard update ----
+function updateScoreBoard(){ scoreBoard.textContent = scores.left + ' : ' + scores.right; }
+
+// ---- Networking: WebRTC DataChannel manual signaling ----
+let pc = null;
+let dc = null;
+let isHost = false;
+let clientLastSent = 0;
+
+function ensurePeerConnection() {
+  if (pc) return;
+  pc = new RTCPeerConnection();
+
+  pc.onicegatheringstatechange = () => {
+    // For convenience we can update the offer/answer textarea when gathering complete
+    if (pc.iceGatheringState === 'complete') {
+      if (isHost) {
+        offerBox.value = JSON.stringify(pc.localDescription);
+      } else {
+        answerBox.value = JSON.stringify(pc.localDescription);
+      }
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    console.log('pc state', pc.connectionState);
+  };
+
+  pc.ondatachannel = (ev) => {
+    console.log('ondatachannel for client: ', ev.channel.label);
+    setupDataChannel(ev.channel);
+  };
+}
+
+function setupDataChannel(channel) {
+  dc = channel;
+  dc.onopen = () => {
+    console.log('DataChannel open');
+    // on open, host should start sending state
+  };
+  dc.onmessage = (ev) => {
+    // parse JSON messages
+    try {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'input') {
+        // from client -> host (client sends right paddle Y)
+        if (isHost) {
+          rightY = msg.rightY; // update right paddle input
+        }
+      } else if (msg.type === 'state') {
+        // from host -> client: authoritative state
+        if (!isHost) {
+          // apply state instantly (could interpolate for smoother)
+          const s = msg.state;
+          ball.x = s.ball.x; ball.y = s.ball.y; ball.vx = s.ball.vx; ball.vy = s.ball.vy;
+          leftY = s.leftY; rightY = s.rightY;
+          scores.left = s.scores.left; scores.right = s.scores.right;
+          updateScoreBoard();
+        }
+      }
+    } catch(e){
+      console.warn('invalid dc msg', e, ev.data);
+    }
+  };
+  dc.onclose = () => { console.log('DataChannel closed'); };
+}
+
+// Host creates offer
+createOfferBtn.addEventListener('click', async () => {
+  isHost = true;
+  currentMode = 'host';
+  modeSelect.value = 'host';
+  updateModeHint();
+
+  ensurePeerConnection();
+
+  // create data channel as host
+  const channel = pc.createDataChannel('pong');
+  setupDataChannel(channel);
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  // wait for ICE gather to complete (or wait 1s then export)
+  await waitForIceComplete(pc, 2000);
+  offerBox.value = JSON.stringify(pc.localDescription);
+});
+
+// Host applies answer pasted back
+applyAnswerBtn.addEventListener('click', async () => {
+  if (!pc || !isHost) { alert('No host peer connection found. Create Offer first.'); return; }
+  const answerStr = answerForHost.value.trim();
+  if (!answerStr) { alert('Paste answer from your friend'); return; }
+  try {
+    const remote = JSON.parse(answerStr);
+    await pc.setRemoteDescription(remote);
+    console.log('Applied remote answer.');
+  } catch(e){
+    alert('Invalid answer JSON: ' + e);
+  }
+});
+
+// Client: paste offer, create answer
+createAnswerBtn.addEventListener('click', async () => {
+  isHost = false;
+  currentMode = 'client';
+  modeSelect.value = 'client';
+  updateModeHint();
+
+  ensurePeerConnection();
+
+  const s = offerForClient.value.trim();
+  if (!s) { alert('Paste the Offer JSON from the Host'); return; }
+  try {
+    const remoteDesc = JSON.parse(s);
+    await pc.setRemoteDescription(remoteDesc);
+  } catch(e){
+    alert('Invalid offer JSON: ' + e);
+    return;
+  }
+
+  // create data channel is triggered by ondatachannel
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  await waitForIceComplete(pc, 2000);
+  answerBox.value = JSON.stringify(pc.localDescription);
+});
+
+// Helper: wait for ICE gathering complete or timeout
+function waitForIceComplete(pc, timeout=2000) {
+  return new Promise(resolve => {
+    if (pc.iceGatheringState === 'complete') return resolve();
+    const timeoutId = setTimeout(() => resolve(), timeout);
+    function check() {
+      if (pc.iceGatheringState === 'complete') {
+        clearTimeout(timeoutId);
+        pc.removeEventListener('icegatheringstatechange', check);
+        resolve();
+      }
+    }
+    pc.addEventListener('icegatheringstatechange', check);
+  });
+}
+
+// Host sends authoritative state over dc
+function sendStateIfHost() {
+  if (!isHost || !dc || dc.readyState !== 'open') return;
+  const state = {
+    ball: {x: ball.x, y: ball.y, vx: ball.vx, vy: ball.vy},
+    leftY, rightY,
+    scores
+  };
+  const msg = {type:'state', state};
+  try { dc.send(JSON.stringify(msg)); } catch(e) { /* ignore */ }
+}
+
+// Client sends input (right paddle) to host
+function sendClientInput() {
+  if (isHost) return;
+  if (!dc || dc.readyState !== 'open') return;
+  const now = Date.now();
+  if (now - clientLastSent < 30) return; // throttle ~30ms
+  clientLastSent = now;
+  const msg = {type:'input', rightY};
+  try { dc.send(JSON.stringify(msg)); } catch(e) {}
+}
+
+// When host is created, periodically send state even if no change
+setInterval(() => {
+  if (running && !paused && isHost) sendStateIfHost();
+}, 60);
+
+// ---- Initialize ----
+resetBall(Math.random() < 0.5);
+draw();
+updateScoreBoard();
+
+// Clean up when user closes page
+window.addEventListener('beforeunload', () => {
+  if (dc) try { dc.close(); } catch(e){}
+  if (pc) try { pc.close(); } catch(e){}
+});
+</script>
+</body>
+</html>
